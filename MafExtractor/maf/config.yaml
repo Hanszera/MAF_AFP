@@ -1,0 +1,35 @@
+seed: 42
+
+train:
+  epochs: 500
+  batch_size: 64
+  lr: 1e-3
+  weight_decay: 1e-4
+  grad_clip: 1.0
+  device: cuda
+
+model:
+  aa_dim: 8
+  hidden: 128
+  window_sizes: [4, 2, 8]
+  learnable_scales: true
+  dropout: 0.1
+
+labels:
+  weak_pos_threshold: -1.0
+  weak_neg_threshold: 0.5
+
+optim:
+  warmup_steps: 200
+  cosine_decay: true
+
+data:
+  max_len: 256
+  train_split: 0.85
+  balance_ratio: 1.0
+  amp_weight: 0.5
+  tmp_weight: 1.0
+
+log:
+  eval_every: 200
+  save_every: 1
