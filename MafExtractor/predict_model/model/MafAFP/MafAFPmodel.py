@@ -239,6 +239,9 @@ class GatedFiLMClassifier(nn.Module):
             nn.Linear(film_hidden_mult * hidden, 2 * hidden),
         )
         self.film_gamma_scale = nn.Parameter(torch.tensor(film_scale_init))
+        self.ca_maf = nn.MultiheadAttention(
+            embed_dim=hidden, num_heads=8, dropout=0.1, batch_first=True
+        )
         self.gate_maf = nn.Linear(maf_dim, hidden)
         nn.init.constant_(self.gate_maf.bias, init_gate_bias_maf)
         self.alpha_maf_logit = nn.Parameter(torch.tensor(float(init_alpha_maf_logit)))
@@ -299,10 +302,7 @@ class GatedFiLMClassifier(nn.Module):
         h_maf = torch.nan_to_num(h_maf, 0.0, 0.0, 0.0)
         q_seq, kv_seq = self._prep_seq_tokens(h_seq)     # [B,1,H], [B,L,H] or [B,1,H]
         kv_maf = self._tokenize_global(h_maf, self.maf_proj)   # [B,1,H]
-        if self.include_self_in_kv and kv_seq.size(1) > 1:
-            kv = torch.cat([kv_maf, kv_seq], dim=1)  # [B,1+L,H]
-        else:
-            kv = kv_maf
+        kv = kv_maf
 
         z_maf_ca, attn_weights  = self.ca_maf(q_seq, kv, kv, need_weights=True,average_attn_weights=False)  # [B,1,H]
         self.ca_maf.last_attn = attn_weights.detach()
