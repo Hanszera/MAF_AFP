@@ -231,3 +231,76 @@ def run_global_interpretation(model, maf_model,val_loader,
         plt.close()
 
     print(f"[GlobalInterpret] 全局解释结果已保存至: {output_dir}")
+
+
+# ============================================================
+# SHAP Analysis Entry Point
+# ============================================================
+def run_shap_analysis(model, maf_model, val_loader, device, output_dir,
+                      n_background=100):
+    """Run two-level SHAP analysis on the validation set.
+
+    Convenience wrapper so the training script can call SHAP directly
+    after training without launching a separate process.
+
+    Parameters
+    ----------
+    model : MafAFPClassifier
+        Trained classifier (with ESM-C backbone + GatedFiLMClassifier).
+    maf_model : MafExtractor
+        Frozen MafExtractor used to produce h_maf.
+    val_loader : DataLoader
+        Validation DataLoader using ``collate_padding``.
+    device : str or torch.device
+        Torch device for the classifier during SHAP.
+    output_dir : str
+        Root output directory.  Plots go to ``<output_dir>/shap/``.
+    n_background : int
+        Number of background samples for ``GradientExplainer``.
+    """
+    import numpy as np
+    from MafExtractor.predict_model.src.shap_analysis import (
+        precompute_embeddings,
+        classifier_level_shap,
+        maf_only_shap,
+    )
+
+    shap_dir = os.path.join(output_dir, "shap")
+    os.makedirs(shap_dir, exist_ok=True)
+
+    # Pre-compute h_seq and h_maf for all validation samples
+    emb = precompute_embeddings(model, maf_model, val_loader, device)
+    h_seq = emb["h_seq"]
+    h_maf = emb["h_maf"]
+    labels = emb["labels"]
+
+    # Enable gradients on the classifier head for SHAP
+    classifier = model.classifier
+    orig_requires_grad = {
+        n: p.requires_grad for n, p in classifier.named_parameters()
+    }
+    for p in classifier.parameters():
+        p.requires_grad = True
+
+    sv_clf, _ = classifier_level_shap(
+        classifier, h_seq, h_maf, labels, device, shap_dir, n_background,
+    )
+    sv_maf, _ = maf_only_shap(
+        classifier, h_seq, h_maf, labels, device, shap_dir, n_background,
+    )
+
+    # Save SHAP values for reproducibility
+    np.savez(
+        os.path.join(shap_dir, "shap_values.npz"),
+        classifier_shap=sv_clf,
+        maf_shap=sv_maf,
+        h_seq=h_seq.numpy(),
+        h_maf=h_maf.numpy(),
+        labels=labels.numpy(),
+    )
+
+    # Restore original requires_grad state
+    for n, p in classifier.named_parameters():
+        p.requires_grad = orig_requires_grad.get(n, False)
+
+    print(f"[SHAP] Analysis complete. Results saved to: {shap_dir}")
