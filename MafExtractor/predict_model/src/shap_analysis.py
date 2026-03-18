@@ -82,6 +82,21 @@ class MAFOnlyWrapper(nn.Module):
         return torch.sigmoid(logits)
 
 
+class ModulatedFeatureWrapper(nn.Module):
+    """Wraps the classification head for post-modulation SHAP.
+
+    Input:  [B, hidden]  (default 512) — the post-LN fused representation z
+    Output: [B, 1]  sigmoid probability
+    """
+
+    def __init__(self, head):
+        super().__init__()
+        self.head = head
+
+    def forward(self, z):
+        return torch.sigmoid(self.head(z))
+
+
 # ==============================================================
 # Pre-compute Embeddings
 # ==============================================================
@@ -118,6 +133,9 @@ def precompute_embeddings(model, maf_model, val_loader, device,
                 h_seq = model.forward_backbone_only(
                     sequence_tokens=protein_tensor.sequence
                 )
+            # 取 CLS token -> [B, 1152]，与 h_maf [B, 128] 维度一致用于 SHAP 分析
+            if h_seq.dim() == 3:
+                h_seq = h_seq[:, 0, :]
 
             all_h_seq.append(h_seq.float().cpu())
             all_h_maf.append(h_maf.float().cpu())
@@ -132,6 +150,93 @@ def precompute_embeddings(model, maf_model, val_loader, device,
         "h_maf": torch.cat(all_h_maf, dim=0),
         "labels": torch.cat(all_labels, dim=0),
         "sequences": all_sequences,
+    }
+
+
+# ==============================================================
+# Extract Post-Modulation Features
+# ==============================================================
+
+def extract_post_modulation_features(classifier, h_seq, h_maf, device):
+    """Replicate GatedFiLMClassifier.forward() internals to extract
+    intermediate representations.
+
+    Parameters
+    ----------
+    classifier : GatedFiLMClassifier
+    h_seq : Tensor [N, seq_dim] or [N, L, seq_dim]  (CPU)
+    h_maf : Tensor [N, maf_dim]  (CPU)
+    device : str or torch.device
+
+    Returns
+    -------
+    dict with CPU tensors, each [N, hidden]:
+        z_post      — post-LN fused representation (classification head input)
+        z_seq       — projected PLM features before FiLM
+        z_seq_film  — FiLM-modulated PLM features
+        z_ca_contrib — cross-attention contribution: alpha * g_maf * z_maf_ca
+    """
+    classifier.eval()
+    N = h_seq.shape[0]
+    batch_size = 64
+
+    all_z_post, all_z_seq, all_z_seq_film, all_z_ca_contrib = [], [], [], []
+
+    with torch.no_grad():
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            hs = h_seq[start:end].to(device)
+            hm = h_maf[start:end].to(device)
+
+            # Clean NaN (same as forward)
+            hs = torch.nan_to_num(hs, 0.0, 0.0, 0.0)
+            hm = torch.nan_to_num(hm, 0.0, 0.0, 0.0)
+
+            # 1) Projection
+            q_seq, kv_seq = classifier._prep_seq_tokens(hs)  # [B,1,H], [B,L,H]
+            kv_maf = classifier._tokenize_global(hm, classifier.maf_proj)  # [B,1,H]
+            kv = torch.cat([kv_seq, kv_maf], dim=1)  # [B, L+1, H]
+
+            # 2) Cross-attention
+            z_maf_ca, _ = classifier.ca_maf(
+                q_seq, kv, kv,
+                need_weights=False, average_attn_weights=False,
+            )  # [B,1,H]
+
+            # 3) z_seq = q_seq (projected PLM, before FiLM)
+            z_seq_b = q_seq  # [B,1,H]
+
+            # 4) FiLM
+            film_in = hm  # [B, maf_dim]
+            gamma_beta = classifier.film(film_in)  # [B, 2H]
+            gamma, beta = gamma_beta.chunk(2, dim=-1)  # [B,H]
+            gamma = torch.tanh(gamma) * classifier.film_gamma_scale
+            z_seq_film_b = (1.0 + gamma).unsqueeze(1) * z_seq_b + beta.unsqueeze(1)  # [B,1,H]
+
+            # 5) Gating + alpha
+            g_maf = torch.sigmoid(
+                classifier.gate_maf(hm) / classifier.gate_temp
+            ).unsqueeze(1)  # [B,1,H]
+            alpha_maf = torch.sigmoid(classifier.alpha_maf_logit)  # scalar
+
+            # 6) Cross-attention contribution
+            ca_contrib_b = alpha_maf * (g_maf * z_maf_ca)  # [B,1,H]
+
+            # 7) Fusion + LayerNorm
+            z = z_seq_film_b + ca_contrib_b  # [B,1,H]
+            z = classifier.post_ln(z)  # [B,1,H]
+            z = z.squeeze(1)  # [B,H]
+
+            all_z_post.append(z.cpu())
+            all_z_seq.append(z_seq_b.squeeze(1).cpu())
+            all_z_seq_film.append(z_seq_film_b.squeeze(1).cpu())
+            all_z_ca_contrib.append(ca_contrib_b.squeeze(1).cpu())
+
+    return {
+        "z_post": torch.cat(all_z_post, dim=0),
+        "z_seq": torch.cat(all_z_seq, dim=0),
+        "z_seq_film": torch.cat(all_z_seq_film, dim=0),
+        "z_ca_contrib": torch.cat(all_z_ca_contrib, dim=0),
     }
 
 
@@ -292,6 +397,8 @@ def maf_only_shap(classifier, h_seq, h_maf, labels,
         sv = sv[0]
     if isinstance(sv, torch.Tensor):
         sv = sv.cpu().numpy()
+    if sv.ndim == 3 and sv.shape[-1] == 1:
+        sv = sv.squeeze(-1)
 
     X_np = h_maf.numpy()
     labels_np = labels.numpy().ravel()
@@ -376,6 +483,285 @@ def maf_only_shap(classifier, h_seq, h_maf, labels,
 
     print(f"[SHAP-MAF] Plots saved to {output_dir}")
     return sv, feat_names
+
+
+# ==============================================================
+# Modulated-feature SHAP  (512-dim)
+# ==============================================================
+
+def modulated_feature_shap(classifier, z_post, z_seq_film, z_ca_contrib,
+                            labels, device, output_dir, n_background=100):
+    """SHAP on the post-modulation fused representation z_post (512-dim).
+
+    Also generates a decomposition chart showing FiLM vs cross-attention
+    contributions for the top SHAP dimensions.
+    """
+    N, hidden = z_post.shape
+    feat_names = [f"Z_{i}" for i in range(hidden)]
+
+    wrapper = ModulatedFeatureWrapper(classifier.head).to(device).eval()
+    # Enable gradients on the head for SHAP
+    for p in wrapper.parameters():
+        p.requires_grad = True
+
+    n_bg = min(n_background, N)
+    bg_idx = np.random.choice(N, size=n_bg, replace=False)
+    background = z_post[bg_idx].to(device)
+
+    print(f"[SHAP-Modulated] N={N}, features={hidden}, background={n_bg}")
+
+    explainer = shap.GradientExplainer(wrapper, background)
+    sv = explainer.shap_values(z_post.to(device))
+
+    if isinstance(sv, list):
+        sv = sv[0]
+    if isinstance(sv, torch.Tensor):
+        sv = sv.cpu().numpy()
+    if sv.ndim == 3 and sv.shape[-1] == 1:
+        sv = sv.squeeze(-1)
+
+    X_np = z_post.numpy()
+    labels_np = labels.numpy().ravel()
+
+    # Base value
+    with torch.no_grad():
+        ev = float(wrapper(background).mean().cpu().item())
+
+    mean_abs = np.abs(sv).mean(axis=0)  # [hidden]
+    top30_idx = np.argsort(mean_abs)[::-1][:30]
+
+    # ---- (a) Beeswarm top 30 ----
+    plt.figure()
+    shap.summary_plot(sv, X_np, feature_names=feat_names,
+                      max_display=30, show=False)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "modulated_beeswarm_top30.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # ---- (b) Bar top 30 ----
+    plt.figure()
+    shap.summary_plot(sv, X_np, feature_names=feat_names,
+                      plot_type="bar", max_display=30, show=False)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "modulated_bar_top30.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # ---- (c) Decomposition: FiLM vs Cross-Attention contribution (top 30) ----
+    film_contrib_np = z_seq_film.numpy()   # [N, hidden]
+    ca_contrib_np = z_ca_contrib.numpy()   # [N, hidden]
+
+    film_mean_abs = np.abs(film_contrib_np).mean(axis=0)  # [hidden]
+    ca_mean_abs = np.abs(ca_contrib_np).mean(axis=0)      # [hidden]
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    y_pos = np.arange(len(top30_idx))
+    dim_labels = [feat_names[i] for i in top30_idx]
+
+    bars_film = ax.barh(y_pos, film_mean_abs[top30_idx],
+                        label="FiLM (modulated PLM)", color="#4C72B0")
+    bars_ca = ax.barh(y_pos, ca_mean_abs[top30_idx],
+                      left=film_mean_abs[top30_idx],
+                      label="Cross-Attention (gated MAF)", color="#DD8452")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(dim_labels, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("Mean |Contribution|")
+    ax.set_title("Post-Modulation Feature Decomposition: FiLM vs Cross-Attention (Top 30 SHAP dims)")
+    ax.legend(loc="lower right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "modulated_decomposition_top30.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # ---- (d) Waterfall: top-1 AFP ----
+    with torch.no_grad():
+        probs = wrapper(z_post.to(device)).cpu().numpy().ravel()
+
+    afp_mask = labels_np == 1
+    non_afp_mask = labels_np == 0
+
+    if afp_mask.any():
+        top_afp_idx = int(np.where(afp_mask)[0][np.argmax(probs[afp_mask])])
+        explanation_afp = shap.Explanation(
+            values=sv[top_afp_idx],
+            base_values=ev,
+            data=X_np[top_afp_idx],
+            feature_names=feat_names,
+        )
+        plt.figure()
+        shap.plots.waterfall(explanation_afp, max_display=15, show=False)
+        plt.title(f"Modulated Features — Top-1 AFP (prob={probs[top_afp_idx]:.3f})")
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "modulated_waterfall_afp.png"),
+                    dpi=300, bbox_inches="tight")
+        plt.close()
+
+    # ---- (e) Waterfall: top-1 non-AFP ----
+    if non_afp_mask.any():
+        top_non_idx = int(np.where(non_afp_mask)[0][np.argmin(probs[non_afp_mask])])
+        explanation_non = shap.Explanation(
+            values=sv[top_non_idx],
+            base_values=ev,
+            data=X_np[top_non_idx],
+            feature_names=feat_names,
+        )
+        plt.figure()
+        shap.plots.waterfall(explanation_non, max_display=15, show=False)
+        plt.title(f"Modulated Features — Top-1 Non-AFP (prob={probs[top_non_idx]:.3f})")
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "modulated_waterfall_non_afp.png"),
+                    dpi=300, bbox_inches="tight")
+        plt.close()
+
+    print(f"[SHAP-Modulated] Plots saved to {output_dir}")
+    return sv, feat_names
+
+
+# ==============================================================
+# FiLM Effect Analysis  (non-SHAP)
+# ==============================================================
+
+def film_effect_analysis(z_seq, z_seq_film, labels, output_dir):
+    """Analyze FiLM modulation effect by comparing z_seq vs z_seq_film.
+
+    Generates 4 plots characterizing how FiLM transforms the PLM representation.
+    """
+    z_seq_np = z_seq.numpy()        # [N, hidden]
+    z_film_np = z_seq_film.numpy()  # [N, hidden]
+    labels_np = labels.numpy().ravel()
+    delta = z_film_np - z_seq_np    # [N, hidden]
+    hidden = delta.shape[1]
+
+    afp_mask = labels_np == 1
+    non_afp_mask = labels_np == 0
+
+    mean_abs_delta = np.abs(delta).mean(axis=0)  # [hidden]
+    top30_idx = np.argsort(mean_abs_delta)[::-1][:30]
+    top10_idx = np.argsort(mean_abs_delta)[::-1][:10]
+
+    # ---- (a) Heatmap: sample × dimension FiLM delta (top 30) ----
+    fig, ax = plt.subplots(figsize=(14, 8))
+    # Sort samples: AFP first, then non-AFP
+    sorted_idx = np.concatenate([np.where(afp_mask)[0], np.where(non_afp_mask)[0]])
+    delta_sub = delta[sorted_idx][:, top30_idx]
+
+    vmax = np.percentile(np.abs(delta_sub), 95)
+    im = sns.heatmap(delta_sub, cmap="RdBu_r", center=0, vmin=-vmax, vmax=vmax,
+                     xticklabels=[f"Z_{i}" for i in top30_idx],
+                     yticklabels=False, ax=ax,
+                     cbar_kws={"label": "FiLM Δ (z_film − z_seq)"})
+    # Mark class boundary
+    n_afp = afp_mask.sum()
+    if n_afp > 0 and non_afp_mask.any():
+        ax.axhline(y=n_afp, color="black", linewidth=1.5, linestyle="--")
+        ax.text(len(top30_idx) + 0.5, n_afp / 2, "AFP",
+                va="center", ha="left", fontsize=10, fontweight="bold")
+        ax.text(len(top30_idx) + 0.5, n_afp + non_afp_mask.sum() / 2, "Non-AFP",
+                va="center", ha="left", fontsize=10, fontweight="bold")
+    ax.set_xlabel("Dimension")
+    ax.set_ylabel("Samples (AFP | Non-AFP)")
+    ax.set_title("FiLM Modulation Delta Heatmap (Top 30 Dimensions)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "film_delta_heatmap_top30.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # ---- (b) Violin: AFP vs non-AFP delta distribution (top 10) ----
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8), sharey=True)
+    axes = axes.flatten()
+    for rank, dim_idx in enumerate(top10_idx):
+        ax = axes[rank]
+        data_afp = delta[afp_mask, dim_idx] if afp_mask.any() else np.array([])
+        data_non = delta[non_afp_mask, dim_idx] if non_afp_mask.any() else np.array([])
+
+        parts_list = []
+        labels_list = []
+        colors = []
+        if len(data_afp) > 0:
+            parts_list.append(data_afp)
+            labels_list.append("AFP")
+            colors.append("#DD8452")
+        if len(data_non) > 0:
+            parts_list.append(data_non)
+            labels_list.append("Non-AFP")
+            colors.append("#4C72B0")
+
+        if parts_list:
+            parts = ax.violinplot(parts_list, positions=range(len(parts_list)),
+                                  showmeans=True, showextrema=True)
+            for pc, c in zip(parts["bodies"], colors):
+                pc.set_facecolor(c)
+                pc.set_alpha(0.7)
+            ax.set_xticks(range(len(labels_list)))
+            ax.set_xticklabels(labels_list, fontsize=8)
+
+        ax.axhline(0, color="gray", linewidth=0.5, linestyle="--")
+        ax.set_title(f"Z_{dim_idx}", fontsize=9)
+        if rank % 5 == 0:
+            ax.set_ylabel("FiLM Δ")
+
+    plt.suptitle("FiLM Delta Distribution: AFP vs Non-AFP (Top 10 Dimensions)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "film_delta_distribution_top10.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # ---- (c) Bar: all 512 dims mean|delta| ----
+    fig, ax = plt.subplots(figsize=(14, 4))
+    sorted_all = np.argsort(mean_abs_delta)[::-1]
+    ax.bar(range(hidden), mean_abs_delta[sorted_all], color="#55A868", width=1.0)
+    ax.set_xlabel("Dimension (sorted by mean |Δ|)")
+    ax.set_ylabel("Mean |FiLM Δ|")
+    ax.set_title(f"FiLM Effect Magnitude Across All {hidden} Dimensions")
+    # Mark top-10 threshold
+    if hidden > 10:
+        ax.axvline(x=9.5, color="red", linewidth=0.8, linestyle="--",
+                   label="Top-10 threshold")
+        ax.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "film_effect_magnitude.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # ---- (d) Bar: class-discriminative dims (Cohen's d, top 20) ----
+    cohens_d = np.zeros(hidden)
+    if afp_mask.sum() >= 2 and non_afp_mask.sum() >= 2:
+        delta_afp = delta[afp_mask]      # [n_afp, hidden]
+        delta_non = delta[non_afp_mask]  # [n_non, hidden]
+        mean_afp = delta_afp.mean(axis=0)
+        mean_non = delta_non.mean(axis=0)
+        std_afp = delta_afp.std(axis=0, ddof=1)
+        std_non = delta_non.std(axis=0, ddof=1)
+        n1, n2 = afp_mask.sum(), non_afp_mask.sum()
+        pooled_std = np.sqrt(((n1 - 1) * std_afp**2 + (n2 - 1) * std_non**2) / (n1 + n2 - 2))
+        pooled_std = np.where(pooled_std < 1e-8, 1e-8, pooled_std)
+        cohens_d = (mean_afp - mean_non) / pooled_std
+
+    top20_d_idx = np.argsort(np.abs(cohens_d))[::-1][:20]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    y_pos = np.arange(len(top20_d_idx))
+    colors = ["#DD8452" if cohens_d[i] > 0 else "#4C72B0" for i in top20_d_idx]
+    ax.barh(y_pos, cohens_d[top20_d_idx], color=colors)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels([f"Z_{i}" for i in top20_d_idx], fontsize=8)
+    ax.invert_yaxis()
+    ax.axvline(0, color="gray", linewidth=0.5)
+    ax.set_xlabel("Cohen's d (AFP − Non-AFP)")
+    ax.set_title("FiLM Delta: Most Class-Discriminative Dimensions (Top 20)")
+    # Legend
+    from matplotlib.patches import Patch
+    ax.legend(handles=[Patch(color="#DD8452", label="AFP > Non-AFP"),
+                       Patch(color="#4C72B0", label="Non-AFP > AFP")],
+              loc="lower right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "film_class_discriminative_dims.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"[FiLM-Effect] Plots saved to {output_dir}")
 
 
 # ==============================================================
@@ -482,9 +868,38 @@ def run_shap_pipeline(model_dir, val_csv, maf_checkpoint=None,
         classifier, h_seq, h_maf, labels, device, output_dir, n_background,
     )
 
-    # ---- Step 4: Save SHAP values ----
+    # ---- Step 4: Extract post-modulation features ----
     print("=" * 60)
-    print("Step 4: Saving SHAP values")
+    print("Step 4: Extracting post-modulation features")
+    print("=" * 60)
+    mod_feats = extract_post_modulation_features(
+        classifier, h_seq, h_maf, device,
+    )
+    z_post = mod_feats["z_post"]
+    z_seq_internal = mod_feats["z_seq"]
+    z_seq_film = mod_feats["z_seq_film"]
+    z_ca_contrib = mod_feats["z_ca_contrib"]
+    print(f"  z_post: {z_post.shape},  z_seq: {z_seq_internal.shape},  "
+          f"z_seq_film: {z_seq_film.shape},  z_ca_contrib: {z_ca_contrib.shape}")
+
+    # ---- Step 5: Modulated-feature SHAP (512-dim) ----
+    print("=" * 60)
+    print("Step 5: Modulated-feature SHAP (512-dim)")
+    print("=" * 60)
+    sv_mod, names_mod = modulated_feature_shap(
+        classifier, z_post, z_seq_film, z_ca_contrib,
+        labels, device, output_dir, n_background,
+    )
+
+    # ---- Step 5b: FiLM effect analysis ----
+    print("=" * 60)
+    print("Step 5b: FiLM effect analysis")
+    print("=" * 60)
+    film_effect_analysis(z_seq_internal, z_seq_film, labels, output_dir)
+
+    # ---- Step 6: Save SHAP values ----
+    print("=" * 60)
+    print("Step 6: Saving SHAP values")
     print("=" * 60)
     npz_path = os.path.join(output_dir, "shap_values.npz")
     np.savez(
@@ -493,14 +908,20 @@ def run_shap_pipeline(model_dir, val_csv, maf_checkpoint=None,
         classifier_features=np.array(names_clf),
         maf_shap=sv_maf,
         maf_features=np.array(names_maf),
+        modulated_shap=sv_mod,
+        modulated_features=np.array(names_mod),
         h_seq=h_seq.numpy(),
         h_maf=h_maf.numpy(),
         labels=labels.numpy(),
+        z_post=z_post.numpy(),
+        z_seq=z_seq_internal.numpy(),
+        z_seq_film=z_seq_film.numpy(),
+        z_ca_contrib=z_ca_contrib.numpy(),
     )
     print(f"  SHAP values -> {npz_path}")
     print(f"  All plots   -> {output_dir}")
 
-    return sv_clf, sv_maf
+    return sv_clf, sv_maf, sv_mod
 
 
 # ==============================================================

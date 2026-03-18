@@ -124,13 +124,13 @@ class MafAFPClassifier(ESMC, PyTorchModelHubMixin):
             maf_dim=clasfier_params['maf_dim'],  # 128
             hidden=clasfier_params['hidden'],
             task=clasfier_params['task'],
-            film_hidden_mult=2,
-            film_scale_init=clasfier_params.get('film_scale', 0.1),
+            film_hidden_mult=clasfier_params.get('film_hidden_mult', 2),
+            film_scale_init=clasfier_params.get('film_scale_init', 0.1),
             gate_temp=clasfier_params.get('gate_temp', 2.0),
-            init_gate_bias_maf=clasfier_params.get('init_gate_bias_maf', -1.5),
-            init_alpha_maf_logit=clasfier_params.get('init_alpha_maf_logit', -1.0),
-            post_dropout=clasfier_params.get('dropout', 0.2),
-            head_hidden_mult=0.5,
+            init_gate_bias_maf=clasfier_params.get('init_gate_bias_maf', -1.0),
+            init_alpha_maf_logit=clasfier_params.get('init_alpha_maf_logit', -0.5),
+            post_dropout=clasfier_params.get('post_dropout', 0.2),
+            head_hidden_mult=clasfier_params.get('head_hidden_mult', 0.5),
         )
 
         id2label = {int(index): str(label) for  label,index in id2label.items()}
@@ -178,7 +178,7 @@ class MafAFPClassifier(ESMC, PyTorchModelHubMixin):
 
     def forward_backbone_only(self, sequence_tokens, sequence_id: Tensor | None = None):
         out = super().forward(sequence_tokens=sequence_tokens,sequence_id=sequence_id)
-        return out.embeddings[:, 0, :]  # CLS
+        return out.embeddings
 
     def forward_classifier_only(self, h_seq, h_maf):
         return self.classifier(h_seq.float(), h_maf.float())
@@ -302,7 +302,7 @@ class GatedFiLMClassifier(nn.Module):
         h_maf = torch.nan_to_num(h_maf, 0.0, 0.0, 0.0)
         q_seq, kv_seq = self._prep_seq_tokens(h_seq)     # [B,1,H], [B,L,H] or [B,1,H]
         kv_maf = self._tokenize_global(h_maf, self.maf_proj)   # [B,1,H]
-        kv = kv_maf
+        kv = torch.cat([kv_seq, kv_maf], dim=1)  # [B, L+1, H]
 
         z_maf_ca, attn_weights  = self.ca_maf(q_seq, kv, kv, need_weights=True,average_attn_weights=False)  # [B,1,H]
         self.ca_maf.last_attn = attn_weights.detach()

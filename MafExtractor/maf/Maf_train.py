@@ -161,7 +161,7 @@ def train_loop(cfg, tmp_csv, amp_csv, out_dir):
 
 
     optim = torch.optim.AdamW(model.parameters(), lr=ast.literal_eval(cfg['train']['lr']), weight_decay=ast.literal_eval(cfg['train']['weight_decay']))
-    bce = nn.BCEWithLogitsLoss()
+    bce = nn.BCEWithLogitsLoss(reduction='none')
     mse = nn.MSELoss()
 
 
@@ -187,7 +187,7 @@ def train_loop(cfg, tmp_csv, amp_csv, out_dir):
         for seqs, X, labs,amp_labels in tqdm(dl_tr):
             X = X.to(device)
             out = model(X,seqs)
-            # 计算窗口级损失（对齐不同尺度的标签）
+
             loss = 0.0
             for i,(s_pred, s_reg) in enumerate(zip(out['local_scores'], out['reg_scores'])):
                 maxL = s_pred.size(1)
@@ -200,9 +200,8 @@ def train_loop(cfg, tmp_csv, amp_csv, out_dir):
                     Lw = min(maxL, t.size(0))
                     Y[bi,:Lw] = (t[:Lw] == 1).float()
                     W[bi,:Lw] = (t[:Lw] != -1).float()
-                # BCEWithLogitsLoss 手动加权
-                l_cls = (bce(s_pred, Y) * (W.mean()+1e-8)) # 近似权重
-                # 回归头：没有真实 ΔG_if，使用 self-supervised 目标：让 s_reg ≈ s_pred（温和约束）
+                # BCEWithLogitsLoss
+                l_cls = (bce(s_pred, Y) * W).sum() / (W.sum() + 1e-8)
                 l_reg = mse(s_reg, s_pred.detach())
                 loss = loss + l_cls + 0.1*l_reg
             optim.zero_grad()
@@ -212,9 +211,7 @@ def train_loop(cfg, tmp_csv, amp_csv, out_dir):
 
 
             global_step += 1
-            # if global_step % cfg['log']['eval_every'] == 0:
-            #     logs['train'].append({"step": global_step, "loss": float(loss.item())})
-                # print(f"[Train] step {global_step} loss={loss.item():.4f}")
+
 
 
 
@@ -265,7 +262,7 @@ def evaluate(model, dl, bce, mse, device):
                     Lw = min(maxL, t.size(0))
                     Y[bi,:Lw] = (t[:Lw] == 1).float()
                     W[bi,:Lw] = (t[:Lw] != -1).float()
-                l_cls = (bce(s_pred, Y) * (W.mean()+1e-8))
+                l_cls = (bce(s_pred, Y) * W).sum() / (W.sum() + 1e-8)
                 l_reg = mse(s_reg, s_pred.detach())
                 loss = loss + l_cls + 0.1*l_reg
             eval_losses.append(loss.item())

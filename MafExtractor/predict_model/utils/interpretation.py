@@ -1,5 +1,6 @@
 # esmc/utils/interpretation.py
 import torch
+import numpy as np
 from esm.sdk.api import ESMProtein
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -10,16 +11,16 @@ from MafExtractor.predict_model.utils.get_embedding import get_esm_embedding
 
 
 class InterpretationHook:
-    """注册 Hook 捕获 cross-attn, FiLM γ/β, gate, α"""
+
     def __init__(self, model):
         self.model = model
         self.records = {}
         self.handles = []
 
     def _hook_cross_attn(self, module, input, output):
-        q, k, v = input
-        if hasattr(module, "last_attn"):
-            self.records["cross_attn_weights"] = module.last_attn.detach().cpu()
+        attn_output, attn_weights = output
+        if attn_weights is not None:
+            self.records["cross_attn_weights"] = attn_weights.detach().cpu()
 
     def _hook_film(self, module, input, output):
         h = output.detach().cpu()
@@ -31,7 +32,7 @@ class InterpretationHook:
         self.records["gate_output"] = torch.sigmoid(output.detach().cpu())
 
     def register(self):
-        """注册 Hook 到模型关键模块"""
+
         if hasattr(self.model, "ca_maf"):
             self.handles.append(self.model.ca_maf.register_forward_hook(self._hook_cross_attn))
         if hasattr(self.model, "film"):
@@ -51,19 +52,18 @@ class InterpretationHook:
 
 
 # ============================================================
-# 可视化函数
+# view
 # ============================================================
 def plot_cross_attention(attn_map, seq_tokens, maf_features, save_path):
-    """绘制 Cross-Attention 热图"""
+
     attn = attn_map.detach().cpu()
 
-    # 自动平均多余维度 (batch/head)
     while attn.dim() > 2:
         attn = attn.mean(0)
 
-    attn = attn.squeeze()  # 去掉多余维度
+    attn = attn.squeeze()
 
-    # 检查维度正确性
+
     if attn.dim() != 2:
         raise ValueError(f"Attention map must be 2D, got shape {attn.shape}")
 
@@ -83,25 +83,98 @@ def plot_cross_attention(attn_map, seq_tokens, maf_features, save_path):
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     plt.close()
-def plot_global_cross_attention(attn_map, seq_tokens, maf_features, save_path, title=None):
-    """绘制 Cross-Attention 热图（兼容全局注意力）"""
-    if attn_map is None or attn_map.numel() == 0:
-        print(f"[Warn] Empty attention map, skip plot: {save_path}")
+def plot_global_cross_attention(attn_all, n_heads, output_dir):
+
+    if attn_all is None or attn_all.numel() == 0:
+        print(f"[Warn] Empty attention map, skip feature attention plots.")
         return
 
-    attn = attn_map.detach().cpu()
-    attn_mean = attn.mean().item()  # 全局注意力强度
+    output_dir = Path(output_dir)
+    attn = attn_all.squeeze(2)  # [N, n_heads, L+1]
+    N, H, Lp1 = attn.shape
+    L = Lp1 - 1  #
 
-    plt.figure(figsize=(5, 4))
-    sns.barplot(x=["Global Cross-Attn"], y=[attn_mean], color="skyblue")
-    plt.ylabel("Attention Strength")
-    plt.title(title or "Global Cross-Attention Strength (mean)")
+    # ---- Plot 1: Head-wise Seq vs MAF ----
+    seq_attn = attn[:, :, :L].sum(dim=-1)   # [N, H]
+    maf_attn = attn[:, :, L]                 # [N, H]
+
+    seq_mean = seq_attn.mean(0).numpy()      # [H]
+    maf_mean = maf_attn.mean(0).numpy()      # [H]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    x = np.arange(H)
+    bars_seq = ax.bar(x, seq_mean, label="Seq Tokens (PLM)", color="#4C72B0", width=0.6)
+    bars_maf = ax.bar(x, maf_mean, bottom=seq_mean, label="MAF Token (Biophysics)", color="#DD8452", width=0.6)
+    for i in range(H):
+        total = seq_mean[i] + maf_mean[i]
+        if total > 0:
+            pct = maf_mean[i] / total * 100
+            ax.text(i, total + 0.005, f"{pct:.1f}%", ha="center", va="bottom", fontsize=8)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"Head {i}" for i in range(H)])
+    ax.set_ylabel("Attention Weight (sum=1)")
+    ax.set_title("Head-wise Attention Split: Seq Tokens vs MAF Token")
+    ax.legend(loc="upper right")
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
+    plt.savefig(output_dir / "global_attn_head_split.png", dpi=300, bbox_inches="tight")
     plt.close()
 
+    # ---- Plot 2:----
+    residue_attn = attn[:, :, :L].mean(dim=1)   # [N, L] avg over heads
+    residue_mean = residue_attn.mean(dim=0).numpy()   # [L]
+    residue_std = residue_attn.std(dim=0).numpy()     # [L]
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    positions = np.arange(L)
+    ax.plot(positions, residue_mean, color="#4C72B0", linewidth=1.5)
+    ax.fill_between(positions,
+                     residue_mean - residue_std,
+                     residue_mean + residue_std,
+                     alpha=0.2, color="#4C72B0")
+    ax.set_xlabel("Residue Position (in padded sequence)")
+    ax.set_ylabel("Mean Attention Weight")
+    ax.set_title("Residue-Level Attention Profile (CLS Query → Seq KV)")
+    ax.axhline(y=1.0 / Lp1, color="gray", linestyle="--", linewidth=0.8, label=f"Uniform={1.0/Lp1:.4f}")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / "global_attn_residue_profile.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # ---- Plot 3----
+
+    head_attn = attn.mean(0).numpy()  # [H, L+1]
+
+    fig, ax = plt.subplots(figsize=(14, 4))
+
+    x_labels = []
+    step = max(1, L // 20)
+    for i in range(L):
+        x_labels.append(str(i) if i % step == 0 else "")
+    x_labels.append("MAF")
+
+    im = sns.heatmap(head_attn, cmap="YlOrRd", ax=ax,
+                     xticklabels=x_labels,
+                     yticklabels=[f"Head {i}" for i in range(H)],
+                     cbar_kws={"label": "Attention Weight"})
+
+    ax.axvline(x=L, color="white", linewidth=2)
+    ax.set_xlabel("KV Position (Seq Tokens | MAF Token)")
+    ax.set_title("Multi-Head Cross-Attention Heatmap (CLS → Seq+MAF)")
+    plt.tight_layout()
+    plt.savefig(output_dir / "global_attn_heatmap.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+    overall_maf_pct = maf_attn.mean().item() * 100
+    print(f"[Attention] MAF token receives {overall_maf_pct:.2f}% of total attention (avg over all heads)")
+    for i in range(H):
+        total = seq_mean[i] + maf_mean[i]
+        pct = maf_mean[i] / total * 100 if total > 0 else 0
+        print(f"  Head {i}: Seq={seq_mean[i]:.4f}, MAF={maf_mean[i]:.4f} ({pct:.1f}%)")
+
+
 def plot_film_gamma_beta(gamma, beta, save_prefix):
-    """绘制 FiLM γ/β 参数变化"""
+    """FiLM γ/β """
     gamma_mean = gamma.mean(0).numpy()
     beta_mean = beta.mean(0).numpy()
     plt.figure(figsize=(8, 4))
@@ -127,7 +200,7 @@ def plot_gate_alpha(gate, alpha_logit, epoch, save_path):
 
 
 # ============================================================
-# 主解释函数
+# main
 # ============================================================
 def run_interpretation(model, seq_tensor, maf_tensor,
                        seq_labels=None,
@@ -135,7 +208,6 @@ def run_interpretation(model, seq_tensor, maf_tensor,
                        output_dir="./interpretation",
                        epoch=None):
     """
-    自动生成解释性可视化结果。
     model: EsmcClassifier
     seq_tensor: [B, L, D]
     maf_tensor: [B, D']
@@ -178,15 +250,13 @@ def run_global_interpretation(model, maf_model,val_loader,
                               maf_features=None, seq_len=None,
                               output_dir="./global_interpretation",
                               device="cuda", max_batches=None):
-    """
-    聚合整个验证集的 cross-attn / FiLM / Gate 特征并绘制全局解释图。
-    """
+
     os.makedirs(output_dir, exist_ok=True)
     model.eval()
     hooker = InterpretationHook(model.classifier)
     hooker.register()
     maf = maf_model.eval()
-    print("[GlobalInterpret] 开始聚合验证集注意力/调制特征...")
+    print("[GlobalInterpret]...")
     rec_all = {"cross_attn_weights": [], "film_gamma": [], "film_beta": [], "gate_output": []}
     with torch.no_grad():
         for i, datas in enumerate(tqdm(val_loader, desc="GlobalInterpret")):
@@ -208,12 +278,16 @@ def run_global_interpretation(model, maf_model,val_loader,
     hooker.remove()
 
     if rec_all["cross_attn_weights"]:
-        attn_all = torch.cat(rec_all["cross_attn_weights"], dim=0)
-        attn_mean = attn_all.mean(0)
-        plot_global_cross_attention(attn_mean,
-                             [f"AA{i}" for i in range(attn_mean.shape[-2])],
-                             maf_features or [f"MAF{i}" for i in range(attn_mean.shape[-1])],
-                             Path(output_dir) / "global_cross_attn.png")
+        # attn shape per batch: [B, n_heads, 1, L+1]
+        # KV 长度可能因 batch 不同略有差异，pad 到最大长度后拼接
+        max_kv = max(a.shape[-1] for a in rec_all["cross_attn_weights"])
+        n_heads = rec_all["cross_attn_weights"][0].shape[1]
+        padded = [
+            torch.nn.functional.pad(a, (0, max_kv - a.shape[-1]))
+            for a in rec_all["cross_attn_weights"]
+        ]
+        attn_all = torch.cat(padded, dim=0)  # [N_total, n_heads, 1, L+1]
+        plot_global_cross_attention(attn_all, n_heads, output_dir)
 
     if rec_all["film_gamma"] and rec_all["film_beta"]:
         gamma = torch.cat(rec_all["film_gamma"], dim=0)
@@ -230,7 +304,7 @@ def run_global_interpretation(model, maf_model,val_loader,
         plt.savefig(Path(output_dir) / "global_gate_hist.png", dpi=300)
         plt.close()
 
-    print(f"[GlobalInterpret] 全局解释结果已保存至: {output_dir}")
+    print(f"[GlobalInterpret] Results saved to: {output_dir}")
 
 
 # ============================================================
@@ -263,6 +337,9 @@ def run_shap_analysis(model, maf_model, val_loader, device, output_dir,
         precompute_embeddings,
         classifier_level_shap,
         maf_only_shap,
+        extract_post_modulation_features,
+        modulated_feature_shap,
+        film_effect_analysis,
     )
 
     shap_dir = os.path.join(output_dir, "shap")
@@ -289,14 +366,32 @@ def run_shap_analysis(model, maf_model, val_loader, device, output_dir,
         classifier, h_seq, h_maf, labels, device, shap_dir, n_background,
     )
 
+    # Post-modulation features
+    mod_feats = extract_post_modulation_features(classifier, h_seq, h_maf, device)
+    z_post = mod_feats["z_post"]
+    z_seq_internal = mod_feats["z_seq"]
+    z_seq_film = mod_feats["z_seq_film"]
+    z_ca_contrib = mod_feats["z_ca_contrib"]
+
+    sv_mod, _ = modulated_feature_shap(
+        classifier, z_post, z_seq_film, z_ca_contrib,
+        labels, device, shap_dir, n_background,
+    )
+    film_effect_analysis(z_seq_internal, z_seq_film, labels, shap_dir)
+
     # Save SHAP values for reproducibility
     np.savez(
         os.path.join(shap_dir, "shap_values.npz"),
         classifier_shap=sv_clf,
         maf_shap=sv_maf,
+        modulated_shap=sv_mod,
         h_seq=h_seq.numpy(),
         h_maf=h_maf.numpy(),
         labels=labels.numpy(),
+        z_post=z_post.numpy(),
+        z_seq=z_seq_internal.numpy(),
+        z_seq_film=z_seq_film.numpy(),
+        z_ca_contrib=z_ca_contrib.numpy(),
     )
 
     # Restore original requires_grad state

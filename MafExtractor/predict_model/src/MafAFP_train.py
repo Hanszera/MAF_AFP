@@ -100,7 +100,7 @@ if __name__ == '__main__':
     model = MafAFPClassifier.from_esm_pretrained(**model_args)
     model.eval()
     print(f"Model has {model.num_params:,} parameters.")
-    train_layer = 1
+    train_layer = 2
     model.freeze_base()
 
     model.unfreeze_last_k_encoder_layers(train_layer)
@@ -122,7 +122,7 @@ if __name__ == '__main__':
     gradient_accumulation_steps = 16
     max_gradient_norm=1.0
     starting_epoch=0
-    num_epochs=10
+    num_epochs=20
 
     base_lr = 5e-5
     head_lr_mult = 5.0
@@ -218,18 +218,6 @@ if __name__ == '__main__':
                         y_prob = torch.sigmoid(y_pred)
                     all_probs.append(y_prob.cpu())
                     all_labels.append(y.cpu())
-                # if index == 0:
-                #     seq_batch = protein_tensor.sequence[:1]
-                #     maf_batch = maf_feature[:1]
-                #     run_interpretation(
-                #         model=model,
-                #         seq_tensor=seq_batch,
-                #         maf_tensor=maf_batch,
-                #         seq_labels=[f"AA{i}" for i in range(seq_batch.size(1))],
-                #         maf_features=["hydropathy", "charge", "mass", "polarity", "size", "aromatic"],
-                #         output_dir=save_path_timestamp,
-                #         epoch=epoch
-                #     )
 
             all_probs = torch.cat(all_probs).numpy()
             all_labels = torch.cat(all_labels).numpy()
@@ -255,27 +243,6 @@ if __name__ == '__main__':
             logger.add_scalar("Acc", acc, epoch)
             logger.add_scalar("MCC", mcc, epoch)
 
-            print(
-                f"Epoch {epoch} | "
-                f"AUC: {auc:.3f}, "
-                f"Sn: {sn:.3f}, "
-                f"Acc: {acc:.3f}, "
-                f"F1: {f1:.3f}, "
-                f"MCC: {mcc:.3f}, " 
-                f"Precision: {precision:.3f}, "
-                f"BestThr: {best_thr:.2f}"
-            )
-
-            logs['test'].append({
-                "epoch": epoch,
-                "AUC": f'{auc:.3f}',
-                "Sn": f'{sn:.3f}',
-                "Acc": f'{acc:.3f}',
-                "F1": f'{f1:.3f}',
-                "MCC": f'{mcc:.3f}',
-                "Precision": f'{precision:.3f}',
-                "BestThr": f'{best_thr:.2f}'
-            })
             precision_metric.reset()
             recall_metric.reset()
 
@@ -315,6 +282,7 @@ if __name__ == '__main__':
                 output_dir=f"{save_path_timestamp}"
             )
 
-        save_json(logs, os.path.join(save_path_timestamp, 'logs.json'))
-
+    print("start SHAP")
+    from MafExtractor.predict_model.utils.interpretation import run_shap_analysis
+    run_shap_analysis(model, maf, val_data_loader, DEVICE, save_path_timestamp)
     print("Done!")
